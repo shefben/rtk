@@ -53,8 +53,28 @@ pub fn run(
     let result = exec_capture(&mut rg_cmd)
         .or_else(|_| {
             let mut grep_cmd = resolved_command("grep");
-            // When we fall back to grep, include all args, not just -rnHZ.
-            grep_cmd.args(["-rnHZ", pattern, path]).args(extra_args);
+            // Fall back to grep when rg is not available.
+            // Filter out rg-specific flags (--glob, --type, etc.)
+            // that GNU grep does not understand.
+            let grep_safe_args: Vec<&String> = extra_args
+                .iter()
+                .filter(|a| {
+                    let s = a.as_str();
+                    !matches!(
+                        s,
+                        "--glob" | "--type" | "--type-add" | "--type-not" |
+                        "--iglob" | "--type-clear" | "--files" | "--sort" |
+                        "--sortr" | "--max-depth" | "--max-filesize" |
+                        "--no-ignore" | "--no-ignore-parent" |
+                        "--no-ignore-vcs" | "--no-ignore-dot" |
+                        "--hidden" | "--follow" | "--trim" | "--passthru"
+                    ) && !s.starts_with("--type-") && !s.starts_with("--glob=")
+                })
+                .collect();
+            grep_cmd.args(["-rnHZ", pattern, path]);
+            for a in grep_safe_args {
+                grep_cmd.arg(a);
+            }
             exec_capture(&mut grep_cmd)
         })
         .context("grep/rg failed")?;
