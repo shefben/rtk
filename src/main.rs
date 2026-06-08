@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 mod analytics;
 mod cmds;
 mod core;
@@ -774,6 +775,7 @@ enum Commands {
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(dead_code)]
 enum HookCommands {
     /// Process Claude Code PreToolUse hook (reads JSON from stdin)
     Claude,
