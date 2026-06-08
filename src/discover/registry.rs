@@ -797,12 +797,15 @@ fn rewrite_segment_inner(
         }
     }
 
+    let match_cmd = normalize_python_module_invocation(cmd_part);
+    let match_cmd = match_cmd.as_ref();
+
     // Use classify_command for correct ignore/prefix handling
-    let rtk_equivalent = match classify_command(cmd_part) {
+    let rtk_equivalent = match classify_command(match_cmd) {
         Classification::Supported { rtk_equivalent, .. } => {
-            let stripped = ENV_PREFIX.replace(cmd_part, "");
+            let stripped = ENV_PREFIX.replace(match_cmd, "");
             let cmd_clean = stripped.trim();
-            if is_excluded(cmd_clean, excluded) {
+            if is_excluded(cmd_clean, excluded) || is_excluded(cmd_part, excluded) {
                 return None;
             }
             rtk_equivalent
@@ -813,7 +816,7 @@ fn rewrite_segment_inner(
     // Find the matching rule (rtk_cmd values are unique across all rules)
     let rule = RULES.iter().find(|r| r.rtk_cmd == rtk_equivalent)?;
 
-    if let Some(parts) = parse_golangci_run_parts(cmd_part) {
+    if let Some(parts) = parse_golangci_run_parts(match_cmd) {
         let rewritten = if parts.global_segment.is_empty() {
             format!("rtk golangci-lint {}", parts.run_segment)
         } else {
@@ -828,7 +831,7 @@ fn rewrite_segment_inner(
     // #196: gh with --json/--jq/--template produces structured output that
     // rtk gh would corrupt — skip rewrite so the caller gets raw JSON.
     if rule.rtk_cmd == "rtk gh" {
-        let args_lower = cmd_part.to_lowercase();
+        let args_lower = match_cmd.to_lowercase();
         if args_lower.contains("--json")
             || args_lower.contains("--jq")
             || args_lower.contains("--template")
@@ -839,7 +842,7 @@ fn rewrite_segment_inner(
 
     // Try each rewrite prefix (longest first) with word-boundary check
     for &prefix in rule.rewrite_prefixes {
-        if let Some(rest) = strip_word_prefix(cmd_part, prefix) {
+        if let Some(rest) = strip_word_prefix(match_cmd, prefix) {
             let rewritten = if rest.is_empty() {
                 format!("{}{}", rule.rtk_cmd, redirect_suffix)
             } else {
@@ -850,6 +853,57 @@ fn rewrite_segment_inner(
     }
 
     None
+}
+
+fn normalize_python_module_invocation(cmd: &str) -> std::borrow::Cow<'_, str> {
+    let Some((program, rest)) = split_first_word(cmd) else {
+        return std::borrow::Cow::Borrowed(cmd);
+    };
+    let rest = rest.trim_start();
+    if !rest.starts_with("-m ") && rest != "-m" {
+        return std::borrow::Cow::Borrowed(cmd);
+    }
+
+    let basename = program
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(program)
+        .trim_matches(['"', '\'']);
+    let lower = basename.to_ascii_lowercase();
+    let normalized = lower.strip_suffix(".exe").unwrap_or(&lower);
+    if normalized == "python"
+        || normalized == "python3"
+        || normalized.strip_prefix("python").is_some_and(|suffix| {
+            !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit() || c == '.')
+        })
+    {
+        std::borrow::Cow::Owned(format!("python {}", rest))
+    } else {
+        std::borrow::Cow::Borrowed(cmd)
+    }
+}
+
+fn split_first_word(cmd: &str) -> Option<(&str, &str)> {
+    let trimmed = cmd.trim_start();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(quote) = trimmed
+        .chars()
+        .next()
+        .filter(|ch| *ch == '"' || *ch == '\'')
+    {
+        let quote_len = quote.len_utf8();
+        if let Some(end_quote) = trimmed[quote_len..].find(quote) {
+            let split_at = quote_len + end_quote + quote_len;
+            return Some((&trimmed[..split_at], &trimmed[split_at..]));
+        }
+    }
+    let split_at = trimmed
+        .char_indices()
+        .find_map(|(idx, ch)| ch.is_whitespace().then_some(idx))
+        .unwrap_or(trimmed.len());
+    Some((&trimmed[..split_at], &trimmed[split_at..]))
 }
 
 /// Strip a command prefix with word-boundary check.
@@ -2323,6 +2377,41 @@ mod tests {
         assert_eq!(
             rewrite_command_no_prefixes("python -m pytest -x tests/", &[]),
             Some("rtk pytest -x tests/".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_python_exe_m_pytest() {
+        assert_eq!(
+            rewrite_command_no_prefixes("python.exe -m pytest tests/", &[]),
+            Some("rtk pytest tests/".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_pathed_python_exe_m_pytest() {
+        assert_eq!(
+            rewrite_command_no_prefixes(".venv/Scripts/python.exe -m pytest tests/", &[]),
+            Some("rtk pytest tests/".into())
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes(r"C:\repo\.venv\Scripts\python.exe -m pytest tests/", &[]),
+            Some("rtk pytest tests/".into())
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes(
+                r#""C:\Users\me\OneDrive - Org\.venv\Scripts\python.exe" -m pytest tests/"#,
+                &[],
+            ),
+            Some("rtk pytest tests/".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_python_exe_m_mypy() {
+        assert_eq!(
+            rewrite_command_no_prefixes(".venv/Scripts/python.exe -m mypy --strict", &[]),
+            Some("rtk mypy --strict".into())
         );
     }
 
