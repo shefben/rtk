@@ -70,48 +70,53 @@ pub fn run(
         rg_cmd.arg(arg);
     }
 
-    let result = exec_capture(&mut rg_cmd)
-        .or_else(|_| {
-            let mut grep_cmd = resolved_command("grep");
-            // Fall back to grep when rg is not available.
-            // 1. Filter out rg-specific flags (--glob, --type, etc.)
-            //    that GNU grep does not understand.
-            // 2. Convert rg long-form flags to grep short-form equivalents
-            //    (--files-with-matches → -l, --count → -c, etc.)
-            let mut grep_safe_args: Vec<String> = Vec::new();
-            for arg in extra_args {
-                let s = arg.as_str();
-                // Skip rg-specific flags entirely
-                if matches!(
-                    s,
-                    "--glob" | "--type" | "--type-add" | "--type-not" |
-                    "--iglob" | "--type-clear" | "--files" | "--sort" |
-                    "--sortr" | "--max-depth" | "--max-filesize" |
-                    "--no-ignore" | "--no-ignore-parent" |
-                    "--no-ignore-vcs" | "--no-ignore-dot" |
-                    "--hidden" | "--follow" | "--trim" | "--passthru"
-                ) || s.starts_with("--type-") || s.starts_with("--glob=")
-                {
-                    continue;
-                }
-                // Convert rg long-form flags to grep short-form
-                let converted = match s {
-                    "--files-with-matches" => "-l",
-                    "--files-without-match" => "-L",
-                    "--only-matching" => "-o",
-                    "--null" => "-Z",
-                    "--count" => "-c",
-                    _ => s,
-                };
-                grep_safe_args.push(converted.to_string());
+    let result = (|| -> Result<_> {
+        let rg_result = exec_capture(&mut rg_cmd).ok();
+        if let Some(r) = rg_result {
+            if r.exit_code == 0 {
+                return Ok(r);
             }
-            grep_cmd.args(["-rnHZ", pattern, path]);
-            for a in &grep_safe_args {
-                grep_cmd.arg(a);
+        }
+        // rg failed (not found or non-zero exit) — fall back to grep.
+        let mut grep_cmd = resolved_command("grep");
+        // Fall back to grep when rg is not available.
+        // 1. Filter out rg-specific flags (--glob, --type, etc.)
+        //    that GNU grep does not understand.
+        // 2. Convert rg long-form flags to grep short-form equivalents
+        //    (--files-with-matches → -l, --count → -c, etc.)
+        let mut grep_safe_args: Vec<String> = Vec::new();
+        for arg in extra_args {
+            let s = arg.as_str();
+            // Skip rg-specific flags entirely
+            if matches!(
+                s,
+                "--glob" | "--type" | "--type-add" | "--type-not" |
+                "--iglob" | "--type-clear" | "--files" | "--sort" |
+                "--sortr" | "--max-depth" | "--max-filesize" |
+                "--no-ignore" | "--no-ignore-parent" |
+                "--no-ignore-vcs" | "--no-ignore-dot" |
+                "--hidden" | "--follow" | "--trim" | "--passthru"
+            ) || s.starts_with("--type-") || s.starts_with("--glob=")
+            {
+                continue;
             }
-            exec_capture(&mut grep_cmd)
-        })
-        .context("grep/rg failed")?;
+            // Convert rg long-form flags to grep short-form
+            let converted = match s {
+                "--files-with-matches" => "-l",
+                "--files-without-match" => "-L",
+                "--only-matching" => "-o",
+                "--null" => "-Z",
+                "--count" => "-c",
+                _ => s,
+            };
+            grep_safe_args.push(converted.to_string());
+        }
+        grep_cmd.args(["-rnHZ", pattern, path]);
+        for a in &grep_safe_args {
+            grep_cmd.arg(a);
+        }
+        exec_capture(&mut grep_cmd).context("grep/rg failed")
+    })()?;
 
     // Format flags (--count, --files-with-matches, etc.) return structured
     // output that is compact per line but can accumulate to 600KB+ across
