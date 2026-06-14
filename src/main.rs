@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 mod analytics;
 mod cmds;
 mod core;
@@ -774,6 +775,7 @@ enum Commands {
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(dead_code)]
 enum HookCommands {
     /// Process Claude Code PreToolUse hook (reads JSON from stdin)
     Claude,
@@ -783,6 +785,8 @@ enum HookCommands {
     Gemini,
     /// Process Copilot preToolUse hook (VS Code + Copilot CLI, reads JSON from stdin)
     Copilot,
+    /// Process Codex CLI PreToolUse hook (reads JSON from stdin)
+    Codex,
     /// Check how a command would be rewritten by the hook engine (dry-run)
     Check {
         /// Target agent
@@ -2220,6 +2224,10 @@ fn run_cli() -> Result<i32> {
             }
             HookCommands::Copilot => {
                 hooks::hook_cmd::run_copilot()?;
+                0
+            }
+            HookCommands::Codex => {
+                hooks::hook_cmd::run_codex()?;
                 0
             }
             HookCommands::Check { agent: _, command } => {

@@ -226,8 +226,48 @@ impl FilterStrategy for MinimalFilter {
 
         // Normalize multiple blank lines to max 2
         let result = MULTIPLE_BLANK_LINES.replace_all(&result, "\n\n");
-        result.trim().to_string()
+
+        // For data formats (JSON, YAML, XML), compactify leading whitespace.
+        // Each 2-space indent level becomes 1 space. Preserves all content.
+        if *lang == Language::Data || *lang == Language::Unknown {
+            compactify_indent(result.trim().to_string())
+        } else {
+            result.trim().to_string()
+        }
     }
+}
+
+/// Reduce indentation in data formats (JSON, YAML, XML) to save tokens.
+/// Normalizes each 2-space indent level to 1 space. Content is never removed.
+pub fn compactify_indent(content: String) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let indented_lines: usize = lines
+        .iter()
+        .filter(|l| !l.trim().is_empty() && l.chars().next().map_or(false, |c| c.is_whitespace()))
+        .count();
+
+    // Only compactify if there are indented lines (structured data)
+    if indented_lines == 0 {
+        return content;
+    }
+
+    let mut out = String::with_capacity(content.len());
+    for line in &lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            out.push('\n');
+            continue;
+        }
+        let indent = line.chars().take_while(|c| c.is_whitespace()).count();
+        // Each 2-space indent level → 1 space
+        let new_indent = indent / 2;
+        for _ in 0..new_indent {
+            out.push(' ');
+        }
+        out.push_str(trimmed);
+        out.push('\n');
+    }
+    out.trim().to_string()
 }
 
 pub struct AggressiveFilter;
@@ -453,6 +493,53 @@ mod tests {
         assert!(
             result.contains("/* not a comment */"),
             "Aggressive filter must not strip comment-like patterns in JSON"
+        );
+    }
+
+    #[test]
+    fn test_json_compactify_indent() {
+        // Deeply indented JSON (4-space nested) should be compactified
+        let json = r#"{
+    "name": "my-app",
+    "scripts": {
+        "build": "next build",
+        "dev": "next dev"
+    },
+    "dependencies": {
+        "react": "^18.0.0",
+        "react-dom": "^18.0.0"
+    }
+}"#;
+        let filter = MinimalFilter;
+        let result = filter.filter(json, &Language::Data);
+        // All content preserved
+        assert!(result.contains("my-app"), "content must be preserved");
+        assert!(result.contains("next build"), "content must be preserved");
+        assert!(result.contains("react-dom"), "content must be preserved");
+        // Indentation reduced (original had 4-space indent, compactified should be less)
+        assert!(
+            result.len() < json.len(),
+            "compactified ({}) should be shorter than original ({})",
+            result.len(),
+            json.len()
+        );
+    }
+
+    #[test]
+    fn test_json_shallow_indent_compactified() {
+        // Shallow JSON (2-space indent) should be compactified to 1-space
+        let json = r#"{
+  "name": "my-app",
+  "version": "1.0.0"
+}"#;
+        let filter = MinimalFilter;
+        let result = filter.filter(json, &Language::Data);
+        assert!(result.contains("my-app"), "content must be preserved");
+        assert!(
+            result.len() < json.len(),
+            "compactified ({}) should be shorter than original ({})",
+            result.len(),
+            json.len()
         );
     }
 

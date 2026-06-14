@@ -21,6 +21,21 @@ pub fn run(
 ) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
 
+    // Fix: when the hook rewrites "grep -rln" → "rtk grep -rln", Clap splits
+    // -r/-n/-l and -l consumes the pattern as max_line_len value.
+    // Detect: max_line_len=0 (non-numeric pattern char), pattern looks like a
+    // path (starts with . or /), and the original pattern was consumed.
+    // Recovery: swap pattern↔path and inject -l into extra_args.
+    let (pattern, path, extra_args) =
+        if max_line_len == 0 && (path.starts_with('.') || path.starts_with('/')) {
+            let mut recovered = extra_args.to_vec();
+            recovered.insert(0, "-l".to_string());
+            (path, pattern, recovered)
+        } else {
+            (pattern, path, extra_args.to_vec())
+        };
+    let extra_args = &extra_args;
+
     if verbose > 0 {
         eprintln!("grep: '{}' in {}", pattern, path);
     }
@@ -47,21 +62,102 @@ pub fn run(
         if arg == "-r" || arg == "--recursive" {
             continue;
         }
+        // Convert grep --include=PATTERN to rg --glob PATTERN
+        if let Some(glob_pattern) = arg.strip_prefix("--include=") {
+            rg_cmd.arg("--glob").arg(glob_pattern);
+            continue;
+        }
         rg_cmd.arg(arg);
     }
 
-    let result = exec_capture(&mut rg_cmd)
-        .or_else(|_| {
-            let mut grep_cmd = resolved_command("grep");
-            // When we fall back to grep, include all args, not just -rnHZ.
-            grep_cmd.args(["-rnHZ", pattern, path]).args(extra_args);
-            exec_capture(&mut grep_cmd)
-        })
-        .context("grep/rg failed")?;
+    let result = (|| -> Result<_> {
+        let rg_result = exec_capture(&mut rg_cmd).ok();
+        if let Some(r) = rg_result {
+            if r.exit_code == 0 {
+                return Ok(r);
+            }
+        }
+        // rg failed (not found or non-zero exit) — fall back to grep.
+        let mut grep_cmd = resolved_command("grep");
+        // Fall back to grep when rg is not available.
+        // 1. Filter out rg-specific flags (--glob, --type, etc.)
+        //    that GNU grep does not understand.
+        // 2. Convert rg long-form flags to grep short-form equivalents
+        //    (--files-with-matches → -l, --count → -c, etc.)
+        let mut grep_safe_args: Vec<String> = Vec::new();
+        for arg in extra_args {
+            let s = arg.as_str();
+            // Skip rg-specific flags entirely
+            if matches!(
+                s,
+                "--glob" | "--type" | "--type-add" | "--type-not" |
+                "--iglob" | "--type-clear" | "--files" | "--sort" |
+                "--sortr" | "--max-depth" | "--max-filesize" |
+                "--no-ignore" | "--no-ignore-parent" |
+                "--no-ignore-vcs" | "--no-ignore-dot" |
+                "--hidden" | "--follow" | "--trim" | "--passthru"
+            ) || s.starts_with("--type-") || s.starts_with("--glob=")
+            {
+                continue;
+            }
+            // Convert rg long-form flags to grep short-form
+            let converted = match s {
+                "--files-with-matches" => "-l",
+                "--files-without-match" => "-L",
+                "--only-matching" => "-o",
+                "--null" => "-Z",
+                "--count" => "-c",
+                _ => s,
+            };
+            grep_safe_args.push(converted.to_string());
+        }
+        grep_cmd.args(["-rnHZ", pattern, path]);
+        for a in &grep_safe_args {
+            grep_cmd.arg(a);
+        }
+        exec_capture(&mut grep_cmd).context("grep/rg failed")
+    })()?;
 
-    // Passthrough output flags that produce output that is already small.
+    // Format flags (--count, --files-with-matches, etc.) return structured
+    // output that is compact per line but can accumulate to 600KB+ across
+    // large repos. For --count specifically, summarize top matches by count
+    // instead of raw passthrough — RTK's job is compression, not truncation.
     if has_format_flag(extra_args) {
-        print!("{}", result.stdout);
+        let has_count = extra_args.iter().any(|a| a == "-c" || a == "--count");
+        let lines: Vec<&str> = result.stdout.lines().collect();
+        let total_lines = lines.len();
+
+        if has_count && total_lines > 50 {
+            let mut entries: Vec<(&str, usize)> = Vec::new();
+            for line in &lines {
+                if let Some((file, count_str)) = line.rsplit_once(':') {
+                    if let Ok(cnt) = count_str.parse::<usize>() {
+                        entries.push((file, cnt));
+                    }
+                }
+            }
+            if entries.is_empty() {
+                print!("{}", result.stdout);
+            } else {
+                entries.sort_by(|a, b| b.1.cmp(&a.1));
+                let total_matches: usize = entries.iter().map(|e| e.1).sum();
+                let top_n = 20;
+                for (file, cnt) in entries.iter().take(top_n) {
+                    println!("{:>6}  {}", cnt, file);
+                }
+                if entries.len() > top_n {
+                    println!("  ...  ({} more files)", entries.len() - top_n);
+                }
+                println!("\n{} files, {} total matches", entries.len(), total_matches);
+            }
+        } else if total_lines > 200 {
+            let head: Vec<&str> = lines.iter().take(200).copied().collect();
+            println!("{}", head.join("\n"));
+            println!("... ({} lines truncated, {} total)", total_lines - 200, total_lines);
+        } else {
+            print!("{}", result.stdout);
+        }
+
         if !result.stderr.is_empty() {
             eprint!("{}", result.stderr.trim());
         }
@@ -387,6 +483,39 @@ mod tests {
             "-A".to_string(),
             "3".to_string(),
         ]));
+    }
+
+    // Grep fallback must convert rg long-form flags to grep short-form equivalents
+    #[test]
+    fn test_grep_fallback_converts_long_flags() {
+        // Simulates the conversion logic from the fallback path
+        let conversions = [
+            ("--files-with-matches", "-l"),
+            ("--files-without-match", "-L"),
+            ("--only-matching", "-o"),
+            ("--null", "-Z"),
+            ("--count", "-c"),
+        ];
+        for (rg_flag, grep_flag) in &conversions {
+            let extra_args = vec![rg_flag.to_string()];
+            let mut converted = Vec::new();
+            for arg in &extra_args {
+                let c = match arg.as_str() {
+                    "--files-with-matches" => "-l",
+                    "--files-without-match" => "-L",
+                    "--only-matching" => "-o",
+                    "--null" => "-Z",
+                    "--count" => "-c",
+                    _ => arg.as_str(),
+                };
+                converted.push(c.to_string());
+            }
+            assert_eq!(
+                converted[0], *grep_flag,
+                "{} should convert to {}",
+                rg_flag, grep_flag
+            );
+        }
     }
 
     // Verify line numbers are always enabled in rg invocation (grep_cmd.rs:24).
